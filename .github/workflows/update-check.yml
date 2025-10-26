@@ -1,0 +1,75 @@
+name: Update Check
+
+"on":
+  schedule:
+    # Run at 06:00 UTC every day
+    - cron: '0 6 * * *'
+
+jobs:
+  check:
+    name: Check latest online releases
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      tor: ${{ steps.check.outputs.tor }}
+      mullvad: ${{ steps.check.outputs.mullvad }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Check latest online releases and decide if build is needed
+        id: check
+        shell: bash
+        run: |
+          check() {
+            local name="$1" latest_cmd="$2" asset_substr="$3"
+            local latest_online
+            latest_online="$(eval "$latest_cmd")"
+            echo "Latest $name version: $latest_online"
+
+            # Check version format
+            if [[ ! "$latest_online" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+              echo "Version $latest_online does not match format X.Y or X.Y.Z. Exiting." >&2
+              return 1
+            fi
+
+            # Check if the release exists (gh returns non-zero exit if not found)
+            if release="$(gh release view "$latest_online" --json assets --jq '(.assets // [])[].name | select(contains("'"$asset_substr"'"))' 2>/dev/null)"; then
+              echo "Release $latest_online exists. Checking assets…"
+              if [ -n "$release" ]; then
+                echo -n "Assets for $name found in release $latest_online: "
+                echo "$release" | sed ':a;N;$!ba;s/\n/, /g' -
+                echo "No build needed."
+                return 0
+              else
+                echo "No $name assets found in release $latest_online. Needs build."
+              fi
+            else
+              echo "Release $latest_online does not exist. Needs build."
+            fi
+            echo "$name=$latest_online" >> "$GITHUB_OUTPUT"
+          }
+
+          check 'mullvad' 'gh api -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" /repos/mullvad/mullvad-browser/releases/latest --jq ".tag_name"' 'mullvad-browser'
+          check 'tor' 'curl -s https://aus1.torproject.org/torbrowser/update_3/release/download-linux-x86_64.json | jq -er ".version"' 'tor-browser'
+
+  build:
+    name: Trigger build workflow
+    runs-on: ubuntu-latest
+    needs: check
+    if: github.event_name == 'schedule' && (needs.check.outputs.mullvad || needs.check.outputs.tor)
+    permissions:
+      actions: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Trigger build workflow
+        shell: bash
+        run: |
+          gh api \
+            --method POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            /repos/${{ github.repository }}/actions/workflows/build.yml/dispatches \
+            -f 'ref=main' -f 'inputs[tor]=${{ needs.check.outputs.tor }}' -f 'inputs[mullvad]=${{ needs.check.outputs.mullvad }}'

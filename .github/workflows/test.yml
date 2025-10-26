@@ -1,0 +1,94 @@
+name: Continuous Tests
+
+"on":
+  workflow_dispatch:
+  push:
+    branches: ['**']
+    paths:
+      - .github/workflows/*.yml
+      - scripts/**.sh
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/*.yml
+      - scripts/**.sh
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+
+      - name: Verify scripts/*.sh permissions to 755
+        shell: bash
+        run: |
+          mapfile -d '' files < <(find scripts -path 'scripts/common' -prune -o -type f -name '*.sh' -print0)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No .sh files found under scripts/. Skipping."
+            exit 0
+          fi
+          bad=0
+          for f in "${files[@]}"; do
+            perm=$(stat -c '%a' "$f")
+            if [[ "$perm" != "755" ]]; then
+              echo "::error file=$f::Expected permissions 755 but found $perm"
+              bad=1
+            fi
+          done
+          if [ $bad -ne 0 ]; then
+            echo -e "\e[91mOne or more scripts do not have 755 permissions.\e[0m"
+            exit 1
+          fi
+          echo -e "\e[92mAll scripts under scripts/ have 755 permissions.\e[0m"
+
+      - name: Test scripts/*.sh (dry run)
+        shell: bash
+        run: |
+          mapfile -d '' files < <(find scripts -type f -name '*.sh' -print0)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No .sh files found under scripts/. Skipping."
+            exit 0
+          fi
+          for f in "${files[@]}"; do
+            echo "bash -n $f"
+            bash -n "$f"
+          done
+
+      - name: 'ShellCheck for scripts/ (level: errors)'
+        uses: ludeeus/action-shellcheck@00cae500b08a931fb5698e11e79bfbd38e612a38
+        with:
+          scandir: './scripts'
+          format: 'tty'
+          severity: 'error'
+
+      - name: 'ShellCheck for scripts/ (level: information)'
+        uses: ludeeus/action-shellcheck@00cae500b08a931fb5698e11e79bfbd38e612a38
+        env:
+          SHELLCHECK_OPTS: -e SC1090 -e SC1091
+        with:
+          scandir: './scripts'
+          format: 'tty'
+        continue-on-error: true
+
+      - name: Write actionlint config
+        shell: bash
+        run: |
+          cat > .github/actionlint.yml <<'YAML'
+          self-hosted-runner:
+            labels:
+              - tor-browser-build
+          paths:
+            .github/workflows/**/*.{yml,yaml}:
+              ignore:
+                - 'shellcheck reported issue in this script: SC1090:.+'
+                - 'shellcheck reported issue in this script: SC1091:.+'
+          YAML
+
+      - name: Validate GitHub Actions workflows with actionlint
+        uses: docker://rhysd/actionlint:latest
+        with:
+          args: -color

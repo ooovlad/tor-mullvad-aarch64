@@ -1,0 +1,82 @@
+# Build artifacts
+build/
+out/
+dist/
+*.tar.xz
+*.tar.gz
+*.tar.bz2
+*.zip
+*.deb
+*.rpm
+*.dmg
+
+# Temporary files
+*.tmp
+*.temp
+/tmp/
+
+# Logs
+*.log
+logs/
+
+# Cache directories
+.cache/
+*.cache
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.env
+
+# OpenStack CLI
+venv-openstack/
+
+# Rust
+target/
+Cargo.lock
+
+# Docker
+.dockerignore
+
+# Build tools
+.rbm/
+rbm.local.conf.bak
+
+# GPG keys (keep them private)
+*.gpg
+*.asc.private
+
+# SSH keys/configs
+id_ssh
+id_ssh.pub
+known_hosts
+
+# Secrets
+rc.sh

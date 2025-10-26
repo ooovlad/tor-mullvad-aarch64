@@ -1,0 +1,550 @@
+name: Build Tor and Mullvad
+
+"on":
+  workflow_dispatch:
+    inputs:
+      tor:
+        description: 'Tor Browser version to build (e.g., 14.5.8). Will not be built if empty.'
+        required: false
+        type: string
+      mullvad:
+        description: 'Mullvad Browser version to build (e.g., 14.5.8). Will not be built if empty.'
+        required: false
+        type: string
+      release:
+        description: 'If checked, a GitHub Release for the build will be created.'
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  runner:
+    name: Create self-hosted runner
+    if: github.event.inputs.mullvad != '' || github.event.inputs.tor != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      server_sshkey: ${{ steps.setup-server.outputs.OPENSTACK_SERVER_SSHKEY }}
+      server_id: ${{ steps.setup-server.outputs.OPENSTACK_SERVER_ID }}
+      server_ip_id: ${{ steps.setup-server.outputs.OPENSTACK_SERVER_IP_ID }}
+      server_ip: ${{ steps.setup-server.outputs.OPENSTACK_SERVER_IP }}
+      server_sshhosts: ${{ steps.setup-server.outputs.OPENSTACK_SERVER_SSHHOSTS }}
+      runner_name: ${{ steps.setup-runner.outputs.ACTIONS_RUNNER_NAME }}
+    steps:
+      - name: Check input syntaxis
+        env:
+          TOR_VERSION: ${{ github.event.inputs.tor }}
+          MULLVAD_VERSION: ${{ github.event.inputs.mullvad }}
+        shell: bash
+        run: |
+          check_version_format() {
+            local name="$1" version="$2"
+            if [ -n "$version" ]; then
+              if [[ ! "$version" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+                echo "Version $version for $name does not match format X.Y or X.Y.Z. Exiting." >&2
+                exit 1
+              fi
+            fi
+          }
+          check_version_format 'mullvad' '${{ github.event.inputs.mullvad }}'
+          check_version_format 'tor' '${{ github.event.inputs.tor }}'
+
+      - name: Checkout repository
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+
+      - name: Create and configure server with OpenStack CLI
+        id: setup-server
+        env:
+          OPENSTACK_RC_SECRETS: ${{ secrets.RC_SECRETS }}
+          OPENSTACK_FLAVOR_CPU: ${{ vars.RUNNER_SERVER_CPU }}
+          OPENSTACK_FLAVOR_RAM: ${{ vars.RUNNER_SERVER_RAM }}
+          OPENSTACK_FLAVOR_DISK: ${{ vars.RUNNER_SERVER_DISK }}
+          OPENSTACK_SERVER_IMAGE: ${{ vars.RUNNER_SERVER_IMAGE }}
+          ROTATION_PASSPHRASE: ${{ secrets.ROTATION_PASSPHRASE }}
+        shell: bash
+        run: chmod +x scripts/setup-server.sh && ./scripts/setup-server.sh
+
+      - name: Install and configure actions-runner on server
+        id: setup-runner
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_ADMINISTRATION }}
+          LABELS: tor-browser-build
+        shell: bash
+        run: |
+          source scripts/common/base.sh
+          if [ ! -f id_ssh ]; then
+            die 'No SSH key found. Exiting.'
+          fi
+          if [ -f ip_ssh.txt ]; then
+            IP="$(cat ip_ssh.txt)"
+          else
+            die 'No IP address file found. Exiting.'
+          fi
+          ACTIONS_RUNNER_NAME="autorunner_$(date +%d.%m.%Y)"
+          # Check if a runner with this name already exists
+          runner_info=$(gh api --paginate \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "/repos/${GITHUB_REPOSITORY}/actions/runners?per_page=100" \
+            --jq '.runners[] | select(.name=="'"${ACTIONS_RUNNER_NAME}"'") | "\(.id) \(.status) \(.busy)"' | head -n1 || true)
+          if [ -n "$runner_info" ]; then
+            if [ "$(printf '%s' "$runner_info" | awk '{print $2}')" = "offline" ]; then
+              info -n "Found offline runner ${ACTIONS_RUNNER_NAME}. Deleting… "
+              gh api -X DELETE \
+                -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                "/repos/${GITHUB_REPOSITORY}/actions/runners/$(printf '%s' "$runner_info" | awk '{print $1}')"
+              success 'deleted'
+            else
+              state_label="$([ "$(printf '%s' "$runner_info" | awk '{print $3}')" = "true" ] && echo active || echo idle)"
+              warn "runner '${ACTIONS_RUNNER_NAME}' exists and is ${state_label}. Using suffixed name."
+              ACTIONS_RUNNER_NAME="${ACTIONS_RUNNER_NAME}-$(date +%H%M%S)-$RANDOM"
+            fi
+          fi
+          info -n 'Getting token… '
+          RUNNER_REGISTRATION_TOKEN="$(gh api \
+            --method POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "/repos/${GITHUB_REPOSITORY}/actions/runners/registration-token" \
+            --jq '.token')"
+          success 'done'
+          ssh_params="-o BatchMode=yes"
+          if [ -f known_hosts ]; then
+            ssh_params+=" -o StrictHostKeyChecking=yes -o UserKnownHostsFile=known_hosts"
+          else
+            warn 'No known hosts entry found. Will accept new fingerprints.'
+            ssh_params+=" -o StrictHostKeyChecking=accept-new"
+          fi
+          info 'Setting up actions runner on server… '
+          echo "ACTIONS_RUNNER_NAME=$ACTIONS_RUNNER_NAME" >> "$GITHUB_OUTPUT"
+          # shellcheck disable=SC2086
+          ssh -i id_ssh $ssh_params "root@${IP}" "REPO=${GITHUB_REPOSITORY} TOKEN=${RUNNER_REGISTRATION_TOKEN} NAME=${ACTIONS_RUNNER_NAME} LABELS=${LABELS} bash -s" < ./scripts/setup-actions-runner.sh
+          success 'done'
+
+  build:
+    name: Build Tor and Mullvad Browsers
+    needs: runner
+    runs-on: [self-hosted, Linux, X64, tor-browser-build]
+    timeout-minutes: 1440
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+
+      - name: Prepare environment
+        id: prepare
+        shell: bash
+        run: |
+          chmod +x scripts/* && sudo ./scripts/setup-environment.sh
+          # Get country code
+          CURL_OPTS=(-fsSm 5 --connect-timeout 3 --retry 1 -H "User-Agent: Mozilla/5.0 (iPhone; CPU iPhone OS 17_7_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Mobile/15E148 Safari/604.1")
+          trim_upper() {
+            tr -d '\r\n' | tr '[:lower:]' '[:upper:]'
+          }
+          is_code() {
+            [[ "$1" =~ ^[A-Z]{2}$ ]]
+          }
+          try_fetch() {
+            local url="$1" out
+            echo "Trying to fetch country code from $url…"
+            if out="$(curl "${CURL_OPTS[@]}" "$url" 2>/dev/null)"; then
+              out="$(printf '%s' "$out" | trim_upper)"
+              if is_code "$out"; then
+                country="$out"
+                return 0
+              fi
+            fi
+            return 1
+          }
+          country=""
+          if command -v jq &>/dev/null; then
+            echo "Trying to fetch country code from https://api.2ip.io…"
+            code="$(curl "${CURL_OPTS[@]}" "https://api.2ip.io" 2>/dev/null | jq -r '.code' | trim_upper || true)"
+            if is_code "$code"; then
+              country="$code"
+            fi
+          fi
+          if [ -z "$country" ]; then
+            try_fetch "https://ipinfo.io/country" \
+              || try_fetch "https://ifconfig.co/country-iso" \
+              || try_fetch "https://ipapi.co/country" || true
+          fi
+          if is_code "$country"; then
+            echo "Country code: $country"
+            echo "COUNTRY=$country" >> "$GITHUB_OUTPUT"
+          else
+            echo "Warning: Unable to determine a valid country code." >&2
+          fi
+
+      - name: Fix RU restrictions
+        if: steps.prepare.outputs.COUNTRY == 'RU'
+        shell: bash
+        run: |
+          source scripts/common/base.sh
+          apt_update
+          apt_install dnsutils jq curl
+          info 'Installing and configuring bol-van/zapret…'
+          sudo -- bash << 'EOSUDO'
+            set -e
+            VER="$(curl -fsSL https://api.github.com/repos/bol-van/zapret/releases/latest | jq -er .tag_name)"
+            curl -fsSLo /tmp/zapret.tar.gz "https://github.com/bol-van/zapret/releases/download/${VER}/zapret-${VER}.tar.gz"
+            mkdir -p /opt/zapret
+            tar -xzf /tmp/zapret.tar.gz -C /opt/zapret --strip-components=1
+            rm -f /tmp/zapret.tar.gz
+            mv scripts/setup-zapret* /opt/zapret/
+            cd /opt/zapret
+            ./install_bin.sh
+            BATCH=1 DOMAINS="mullvad.net" SKIP_TPWS=1 ENABLE_HTTP=1 ENABLE_TLS12=1 ENABLE_TLS13=1 ENABLE_HTTP3=0 REPEATS=5 SCANLEVEL=quick SKIP_DNSCHECK=1 SKIP_IPBLOCK=1 ./blockcheck.sh | ./setup-zapret-parse-blockcheck.sh
+            sed -i 's/^MODE_FILTER=.*/MODE_FILTER=hostlist/' config
+            echo -e "mullvad.net\ntorproject.org" > ipset/zapret-hosts-user.txt
+            IFACE_LAN=eth0 ./setup-zapret-inject-unattend.sh -x install_easy.sh
+          EOSUDO
+          success 'done'
+
+      - name: Build Tor Browser
+        if: github.event.inputs.tor != ''
+        env:
+          VERSION: ${{ github.event.inputs.tor }}
+          COUNTRY_CODE: ${{ steps.prepare.outputs.COUNTRY }}
+        shell: bash
+        run: ./scripts/build-tor-mullvad.sh tor "$VERSION"
+
+      - name: Upload build artifacts for Tor Browser
+        if: github.event.inputs.tor != ''
+        uses: actions/upload-artifact@d7079ed2676fdfb4e85f258567c4596876234434
+        with:
+          name: tor-browser-${{ github.event.inputs.tor }}-linux-arm64
+          path: build/out/tor/
+          retention-days: 14
+
+      - name: Build Mullvad Browser
+        if: github.event.inputs.mullvad != ''
+        env:
+          VERSION: ${{ github.event.inputs.mullvad }}
+          COUNTRY_CODE: ${{ steps.prepare.outputs.COUNTRY }}
+        shell: bash
+        run: ./scripts/build-tor-mullvad.sh mullvad "$VERSION"
+
+      - name: Upload build artifacts for Mullvad Browser
+        if: github.event.inputs.mullvad != ''
+        uses: actions/upload-artifact@d7079ed2676fdfb4e85f258567c4596876234434
+        with:
+          name: mullvad-browser-${{ github.event.inputs.mullvad }}-linux-arm64
+          path: build/out/mullvad/
+          retention-days: 14
+
+      - name: Create or get release and upload assets
+        if: ${{ ( github.actor == 'github-actions[bot]' && github.ref_name == github.event.repository.default_branch ) || github.event.inputs.release == 'true' }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          TOR_VERSION: ${{ github.event.inputs.tor }}
+          MULLVAD_VERSION: ${{ github.event.inputs.mullvad }}
+        shell: bash
+        run: |
+          if [ -z "$(find build/out/ -type f -print -quit 2>/dev/null)" ]; then
+            echo "No files found in build/out/. Exiting."
+            exit 1
+          fi
+
+          # Helper: run curl and capture body + status code
+          curl_json() {
+            local method="$1"; shift
+            local url="$1"; shift
+            local data="${1-}"
+            local http_code
+            if [[ -n "${data}" ]]; then
+              http_code=$(curl -sS -X "${method}" -H "Authorization: Bearer ${GITHUB_TOKEN}" -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" \
+                -H "Content-Type: application/json" \
+                -d "${data}" \
+                -o /tmp/resp.json -w "%{http_code}" "${url}")
+            else
+              http_code=$(curl -sS -X "${method}" -H "Authorization: Bearer ${GITHUB_TOKEN}" -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" \
+                -o /tmp/resp.json -w "%{http_code}" "${url}")
+            fi
+            echo "${http_code}"
+          }
+
+          release() {
+            local TAG="$1"
+            local REL_NAME="$TAG"
+            local REL_BODY
+            REL_BODY="$(echo -e "Tor Browser and Mullvad Browser for ARM64/aarch64 Linux systems.\nRelease for version **${TAG}**\n### Changelog\n- [Mullvad Browser](https://github.com/mullvad/mullvad-browser/releases/tag/${TAG})\n- [Tor Browser](https://blog.torproject.org/category/releases/)\n\n###### Note: One browser may be released faster than the other. Assets for the other will be uploaded upon release.")"
+            local ASSETS_GLOBS="$2"
+            local http_code payload release_json release_id html_url upload_url files patterns existing_assets name name_uri asset_id mime
+            # 1) Try to get existing release by tag
+            http_code=$(curl_json GET "https://api.github.com/repos/${REPO}/releases/tags/${TAG}" || true)
+            if [[ "${http_code}" == "200" ]]; then
+              echo "Release for tag ${TAG} exists. Reusing."
+              release_json="$(cat /tmp/resp.json)"
+            elif [[ "${http_code}" == "404" ]]; then
+              echo "No release for tag ${TAG}. Creating a new release."
+
+              # Prevent creating a release with a tag lower than the latest release
+              http_code=$(curl_json GET "https://api.github.com/repos/${REPO}/releases/latest" || true)
+              if [[ "${http_code}" == "200" ]]; then
+                local latest_tag tag_clean lower
+                latest_tag="$(jq -r '.tag_name' <<< "$(cat /tmp/resp.json)")"
+                if [[ -n "${latest_tag}" && "${latest_tag}" != "null" ]]; then
+                  latest_tag="${latest_tag#[Vv]}"
+                  tag_clean="${TAG#[Vv]}"
+                  if [[ "${latest_tag}" =~ ^[0-9]+(\.[0-9]+){1,2}$ ]]; then
+                    lower="$(printf "%s\n%s\n" "${tag_clean}" "${latest_tag}" | sort -V | head -n1)"
+                    if [[ "${lower}" == "${tag_clean}" && "${tag_clean}" != "${latest_tag}" ]]; then
+                      echo "::warning title=Release::Requested tag ${TAG} is lower than latest release tag ${latest_tag}. Skipping release creation." >&2
+                      return 0
+                    fi
+                  fi
+                fi
+              elif [[ "${http_code}" == "404" ]]; then
+                echo "No existing releases found. Proceeding without version check."
+              else
+                echo "::warning title=Release::Could not fetch latest release (HTTP ${http_code}). Proceeding without version check." >&2
+              fi
+
+              # Build request payload
+              # Note: If the tag doesn't exist, GitHub will create it at target_commitish
+              payload=$(jq -n \
+                --arg tag_name "${TAG}" \
+                --arg name "${REL_NAME}" \
+                --arg body "${REL_BODY:-}" \
+                --argjson draft false \
+                --argjson prerelease false \
+                --arg target_commitish "${SHA}" \
+                '{ tag_name: $tag_name,
+                  name: $name,
+                  body: $body,
+                  draft: $draft,
+                  prerelease: $prerelease,
+                  target_commitish: $target_commitish }'
+              )
+
+              http_code=$(curl_json POST "https://api.github.com/repos/${REPO}/releases" "${payload}")
+              if [[ "${http_code}" != "201" ]]; then
+                echo "Failed to create release. HTTP ${http_code}"
+                cat /tmp/resp.json || true
+                exit 1
+              fi
+              release_json="$(cat /tmp/resp.json)"
+            else
+              echo "Unexpected error getting release. HTTP ${http_code}"
+              cat /tmp/resp.json || true
+              exit 1
+            fi
+
+            release_id=$(jq -r '.id' <<< "${release_json}")
+            html_url=$(jq -r '.html_url' <<< "${release_json}")
+            upload_url=$(jq -r '.upload_url' <<< "${release_json}" | sed -E 's/\{.*\}$//')
+
+            if [[ -z "${release_id}" || "${release_id}" == "null" ]]; then
+              echo "Could not determine release ID."
+              echo "${release_json}"
+              exit 1
+            fi
+
+            echo "Release URL: ${html_url}"
+
+            # 2) Upload assets if any files match
+            # Expand globs into a file list. Users can provide multiple patterns (space-separated).
+            shopt -s globstar nullglob
+            files=()
+            if [[ -n "${ASSETS_GLOBS:-}" ]]; then
+              # shellcheck disable=SC2206
+              patterns=(${ASSETS_GLOBS})
+              for pat in "${patterns[@]}"; do
+                for f in ${pat}; do
+                  if [[ -f "$f" ]]; then files+=("$f"); fi
+                done
+              done
+            fi
+
+            if (( ${#files[@]} == 0 )); then
+              echo "No assets to upload (ASSETS_GLOBS='${ASSETS_GLOBS:-}'). Skipping asset upload."
+              exit 0
+            fi
+
+            echo "Uploading ${#files[@]} asset(s)..."
+            # Fetch existing assets to handle duplicates
+            http_code=$(curl_json GET "https://api.github.com/repos/${REPO}/releases/${release_id}/assets")
+            if [[ "${http_code}" != "200" ]]; then
+              echo "Failed to list existing assets. HTTP ${http_code}"
+              cat /tmp/resp.json || true
+              exit 1
+            fi
+            existing_assets="$(cat /tmp/resp.json)"
+
+            for f in "${files[@]}"; do
+              name="$(basename "$f")"
+              name_uri=$(jq -rn --arg x "${name}" '$x|@uri')
+
+              # If an asset with the same name exists, delete it to allow re-upload
+              asset_id=$(jq -r --arg name "${name}" '.[] | select(.name==$name) | .id' <<< "${existing_assets}" | head -n1 || true)
+              if [[ -n "${asset_id}" && "${asset_id}" != "null" ]]; then
+                echo "Deleting existing asset '${name}' (id=${asset_id})..."
+                http_code=$(curl_json DELETE "https://api.github.com/repos/${REPO}/releases/assets/${asset_id}")
+                if [[ "${http_code}" != "204" ]]; then
+                  echo "Failed to delete existing asset ${name}. HTTP ${http_code}"
+                  cat /tmp/resp.json || true
+                  exit 1
+                fi
+              fi
+
+              mime=$(file --mime-type -b "$f" || echo "application/octet-stream")
+              echo "Uploading '${name}' (${mime})..."
+              # Note uploads use uploads.github.com
+              http_code=$(curl -sS -X POST \
+                -H "Authorization: Bearer ${GITHUB_TOKEN}" -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" \
+                -H "Content-Type: ${mime}" \
+                --data-binary @"${f}" \
+                -o /tmp/resp.json -w "%{http_code}" \
+                "${upload_url}?name=${name_uri}")
+
+              if [[ "${http_code}" != "201" ]]; then
+                echo "Failed to upload ${name}. HTTP ${http_code}"
+                cat /tmp/resp.json || true
+                exit 1
+              fi
+              echo "Uploaded '${name}'."
+            done
+
+            echo "Done. Release: ${html_url}"
+          }
+
+          if [ -n "$TOR_VERSION" ] && [ -n "$MULLVAD_VERSION" ]; then
+            if [ "$TOR_VERSION" != "$MULLVAD_VERSION" ]; then
+              if [[ "$(printf "%s\n" "$TOR_VERSION" "$MULLVAD_VERSION" | sort -V | tail -n1)" == "$TOR_VERSION" ]]; then
+                echo "Tor $TOR_VERSION > Mullvad $MULLVAD_VERSION"
+                release "$MULLVAD_VERSION" "build/out/mullvad/**"
+                release "$TOR_VERSION" "build/out/tor/**"
+              else
+                echo "Mullvad $MULLVAD_VERSION > Tor $TOR_VERSION"
+                release "$TOR_VERSION" "build/out/tor/**"
+                release "$MULLVAD_VERSION" "build/out/mullvad/**"
+              fi
+            else
+              release "$TOR_VERSION" "build/out/**"
+            fi
+          elif [ -n "$TOR_VERSION" ]; then
+            release "$TOR_VERSION" "build/out/tor/**"
+          elif [ -n "$MULLVAD_VERSION" ]; then
+            release "$MULLVAD_VERSION" "build/out/mullvad/**"
+          else
+            echo "No version specified for release. Exiting."
+            exit 1
+          fi
+
+  cleanup:
+    name: Cleanup server and runner
+    needs: [runner, build]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: none
+    steps:
+      - name: Uninstall runner
+        if: ${{ ( needs.runner.outputs.server_ip != '' && needs.runner.outputs.server_sshkey != '' ) || needs.runner.outputs.runner_name != '' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_ADMINISTRATION }}
+          IP: ${{ needs.runner.outputs.server_ip }}
+          SSHKEY: ${{ needs.runner.outputs.server_sshkey }}
+          SSHHOSTS: ${{ needs.runner.outputs.server_sshhosts }}
+          NAME: ${{ needs.runner.outputs.runner_name }}
+          ROTATION_PASSPHRASE: ${{ secrets.ROTATION_PASSPHRASE }}
+        shell: bash
+        run: |
+          if [ -n "$SSHKEY" ] && [ -n "$IP" ]; then
+            command -v openssl >/dev/null || sudo apt-get install -qq openssl
+            TOKEN="$(gh api \
+              --method POST \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "/repos/${GITHUB_REPOSITORY}/actions/runners/remove-token" \
+              | jq -er .token)"
+            touch id_ssh
+            chmod 600 id_ssh
+            printf %s "$SSHKEY" | openssl base64 -d -A | openssl enc -d -aes-256-cbc -pbkdf2 -k "$ROTATION_PASSPHRASE" -out id_ssh
+            IP="$(printf %s "$IP" | openssl base64 -d -A | openssl enc -d -aes-256-cbc -pbkdf2 -k "$ROTATION_PASSPHRASE")"
+            ssh_params="-o BatchMode=yes"
+            if [ -z "$SSHHOSTS" ]; then
+              echo "No known hosts entry found. Will accept new fingerprints."
+              ssh_params+=" -o StrictHostKeyChecking=accept-new"
+            else
+              printf %s "$SSHHOSTS" | openssl base64 -d -A | openssl enc -d -aes-256-cbc -pbkdf2 -k "$ROTATION_PASSPHRASE" -out known_hosts
+              ssh_params+=" -o StrictHostKeyChecking=yes -o UserKnownHostsFile=known_hosts"
+            fi
+            # shellcheck disable=SC2086
+            ssh -i id_ssh $ssh_params "root@${IP}" "cd /opt/actions-runner/; ./svc.sh uninstall; sudo -u actions ./config.sh remove --token ${TOKEN}"
+          elif [ -n "$NAME" ]; then
+            runner_id="$(gh api --paginate \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "/repos/${GITHUB_REPOSITORY}/actions/runners?per_page=100" \
+              --jq '.runners[] | select(.name=="'"$NAME"'") | .id' | head -n1)"
+            if [ -n "$runner_id" ]; then
+              echo "Deleting runner $NAME…"
+              gh api -X DELETE \
+                -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                "/repos/${GITHUB_REPOSITORY}/actions/runners/${runner_id}"
+            else
+              echo "Runner $NAME not found in $GITHUB_REPOSITORY."
+              exit 1
+            fi
+          else
+            echo "Insufficient information to uninstall runner. Exiting."
+            exit 1
+          fi
+
+      - name: Delete server
+        if: needs.runner.outputs.server_id != '' || needs.runner.outputs.server_ip_id != ''
+        env:
+          RC_SECRETS: ${{ secrets.RC_SECRETS }}
+          ID: ${{ needs.runner.outputs.server_id }}
+          IP_ID: ${{ needs.runner.outputs.server_ip_id }}
+        shell: bash
+        run: |
+          error() {
+            echo -e "\e[91m$1\e[0m" >&2
+          }
+          sudo apt-get update -qq
+          sudo apt-get install -qq python3 virtualenv python3-pip 1>/dev/null
+          virtualenv env 1>/dev/null
+          source env/bin/activate
+          pip3 install -qq python-openstackclient
+          echo "Installed: $(openstack --version)"
+
+          source /dev/stdin <<< "$RC_SECRETS"
+          if [ -z "$OS_PASSWORD" ]; then
+            error 'OS_PASSWORD is empty, check RC_SECRETS'
+            exit 1
+          fi
+
+          exec 2> >(sed -E 's/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/***/g; s@https?://[^\ ]+@***@g' >&2)
+
+          bad=0
+          if [ -n "$ID" ]; then
+            echo -n 'Deleting server… '
+            if openstack server delete "$ID"; then
+              echo 'done'
+            else
+              echo; error 'Failed to delete server or it no longer exists'; bad=1
+            fi
+          fi
+
+          if [ -n "$IP_ID" ]; then
+            echo -n 'Deleting floating IP… '
+            if openstack floating ip delete "$IP_ID"; then
+              echo 'done'
+            else
+              echo; error 'Failed to delete floating IP or it no longer exists'; bad=1
+            fi
+          fi
+          if [ $bad -ne 0 ]; then
+            exit 1
+          fi
+          exit 0
