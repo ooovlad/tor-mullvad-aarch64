@@ -28,7 +28,7 @@ ensure_network() {
     success "$name"
   else
     info -n "Creating network $name… "
-    openstack network create -f value -c name "$name" &>/dev/null
+    openstack network create -f value -c name "$name" >/dev/null
     success "done"
   fi
 }
@@ -40,7 +40,7 @@ ensure_subnet() {
     success "$name"
   else
     info -n "Creating subnet $name ($cidr)… "
-    openstack subnet create -f value -c name --subnet-range "$cidr" --network "$net_name" "$name" &>/dev/null
+    openstack subnet create -f value -c name --subnet-range "$cidr" --network "$net_name" "$name" >/dev/null
     success "done"
   fi
 }
@@ -73,7 +73,7 @@ ensure_external_network() {
 ensure_router() {
   local router_name="$1" ext_net_id="$2" subnet_name="$3"
   local created=0
-  if openstack router show -f value -c id "$router_name" >/dev/null 2>&1; then
+  if openstack router show -f value -c id "$router_name" &>/dev/null; then
     info -n "Router exists: "
     success "$router_name"
   else
@@ -110,8 +110,7 @@ ensure_keypair() {
   info -n "Creating keypair $key_name… "
   if ! out="$(openstack keypair create -f value -c name --public-key "$pubkey_path" "$key_name" 2>&1)"; then
     if [[ "$out" == *"already exists"* ]]; then
-      # Recreate to ensure key content matches
-      openstack keypair delete "$key_name" >/dev/null || true
+      openstack keypair delete "$key_name" >/dev/null
       openstack keypair create -f value -c name --public-key "$pubkey_path" "$key_name" >/dev/null || die "Unable to (re)create keypair $key_name"
       success "recreated"
       return 0
@@ -125,12 +124,12 @@ ensure_keypair() {
 ensure_flavor() {
   local var="$1" prefix="$2" cpu="$3" ram_gib="$4" disk_gb="$5"
   local id="$prefix.$cpu.$ram_gib.$disk_gb"
-  if openstack flavor show -f value -c name "$id" >/dev/null 2>&1; then
+  if openstack flavor show -f value -c name "$id" &>/dev/null; then
     eval "$var"="\"$id\""
     return 0
   fi
   info -n "Creating flavor… "
-  if openstack flavor create -f value -c name --id "$id" --vcpus "$cpu" --ram "$((1024 * ram_gib))" --disk "$disk_gb" --private --project-domain "$OS_PROJECT_ID" --description "${cpu} vCPU, ${ram_gib}GiB RAM, ${disk_gb}GB local disk" -- "${cpu}cpu-${ram_gib}ram-${disk_gb}gb" 2>&1; then
+  if openstack flavor create -f value -c name --id "$id" --vcpus "$cpu" --ram "$((1024 * ram_gib))" --disk "$disk_gb" --private --project-domain "$OS_PROJECT_ID" --description "${cpu} vCPU, ${ram_gib}GiB RAM, ${disk_gb}GB local disk" -- "${cpu}cpu-${ram_gib}ram-${disk_gb}gb" >/dev/null; then
     success "done"
     eval "$var"="\"$id\""
     return 0
@@ -216,7 +215,7 @@ wait_ssh_ready() {
   local start now
   start=$(date +%s)
   while true; do
-    if ssh-keyscan -T 5 "$ip" >/dev/null 2>&1; then
+    if ssh-keyscan -T 5 "$ip" &>/dev/null; then
       success 'ok'
       return 0
     fi
