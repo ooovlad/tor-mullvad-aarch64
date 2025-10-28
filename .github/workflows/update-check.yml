@@ -35,7 +35,7 @@ jobs:
             fi
 
             # Check if the release exists (gh returns non-zero exit if not found)
-            if release="$(gh release view "$latest_online" --json assets --jq '(.assets // [])[].name | select(contains("'"$asset_substr"'"))' 2>/dev/null)"; then
+            if release="$(gh release view "$latest_online" --repo "$GITHUB_REPOSITORY" --json assets --jq '(.assets // [])[].name | select(contains("'"$asset_substr"'"))')"; then
               echo "Release $latest_online exists. Checking assets…"
               if [ -n "$release" ]; then
                 echo -n "Assets for $name found in release $latest_online: "
