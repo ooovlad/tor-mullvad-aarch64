@@ -8,7 +8,7 @@ name: Update Check
 jobs:
   check:
     name: Check latest online releases
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
     permissions:
       contents: read
     outputs:
@@ -30,7 +30,7 @@ jobs:
 
             # Check version format
             if [[ ! "$latest_online" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
-              echo "Version $latest_online does not match format X.Y or X.Y.Z. Exiting." >&2
+              echo "::error::Version $latest_online for $name does not match format X.Y or X.Y.Z. Exiting." >&2
               return 1
             fi
 
@@ -41,6 +41,7 @@ jobs:
                 echo -n "Assets for $name found in release $latest_online: "
                 echo "$release" | sed ':a;N;$!ba;s/\n/, /g' -
                 echo "No build needed."
+                echo "🆗 Checked **${name}** version ${latest_online}: up to date. Build is not required." >> "$GITHUB_STEP_SUMMARY"
                 return 0
               else
                 echo "No $name assets found in release $latest_online. Needs build."
@@ -49,6 +50,7 @@ jobs:
               echo "Release $latest_online does not exist. Needs build."
             fi
             echo "$name=$latest_online" >> "$GITHUB_OUTPUT"
+            echo "🆕 Detected new **${name}** version: ${latest_online}. Build workflow will be triggered." >> "$GITHUB_STEP_SUMMARY"
           }
 
           check 'mullvad' 'gh api -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" /repos/mullvad/mullvad-browser/releases/latest --jq ".tag_name"' 'mullvad-browser'
@@ -56,7 +58,7 @@ jobs:
 
   build:
     name: Trigger build workflow
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
     needs: check
     if: github.event_name == 'schedule' && (needs.check.outputs.mullvad || needs.check.outputs.tor)
     permissions:
@@ -71,5 +73,5 @@ jobs:
             --method POST \
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
-            /repos/${{ github.repository }}/actions/workflows/build.yml/dispatches \
-            -f 'ref=main' -f 'inputs[tor]=${{ needs.check.outputs.tor }}' -f 'inputs[mullvad]=${{ needs.check.outputs.mullvad }}'
+            '/repos/${{ github.repository }}/actions/workflows/build.yml/dispatches' \
+            -f 'ref=${{ github.ref_name }}' -f 'inputs[tor]=${{ needs.check.outputs.tor }}' -f 'inputs[mullvad]=${{ needs.check.outputs.mullvad }}'

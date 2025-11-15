@@ -4,11 +4,11 @@ name: Build Tor and Mullvad
   workflow_dispatch:
     inputs:
       tor:
-        description: 'Tor Browser version to build (e.g., 14.5.8). Will not be built if empty.'
+        description: 'Tor Browser version to build (e.g., 15.0.1). Will not be built if empty.'
         required: false
         type: string
       mullvad:
-        description: 'Mullvad Browser version to build (e.g., 14.5.8). Will not be built if empty.'
+        description: 'Mullvad Browser version to build (e.g., 15.0.1). Will not be built if empty.'
         required: false
         type: string
       release:
@@ -17,11 +17,24 @@ name: Build Tor and Mullvad
         default: false
         type: boolean
 
+run-name: >-
+  ${{ ( inputs.tor != '' && inputs.mullvad != '' &&
+          format('Build Tor {0} and Mullvad {1}', inputs.tor, inputs.mullvad) ) ||
+      ( inputs.tor != '' &&
+          format('Build Tor {0}', inputs.tor) ) ||
+      ( inputs.mullvad != '' &&
+          format('Build Mullvad {0}', inputs.mullvad) ) ||
+      'Build nothing (no versions specified)' }}
+
+env:
+  DEPENDENCIES_ZAPRET_VERSION: 'v72.2'
+  DEPENDENCIES_ZAPRET_SHA256: '4daa05558cc8bc06ea5df795922efb39c8e7247f9e4d3c7a2262cff49f9bf864'
+
 jobs:
   runner:
     name: Create self-hosted runner
     if: github.event.inputs.mullvad != '' || github.event.inputs.tor != ''
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
     permissions:
       contents: read
     outputs:
@@ -119,8 +132,14 @@ jobs:
           fi
           info 'Setting up actions runner on server… '
           echo "ACTIONS_RUNNER_NAME=$ACTIONS_RUNNER_NAME" >> "$GITHUB_OUTPUT"
-          # shellcheck disable=SC2086
-          ssh -i id_ssh $ssh_params "root@${IP}" "REPO=${GITHUB_REPOSITORY} TOKEN=${RUNNER_REGISTRATION_TOKEN} NAME=${ACTIONS_RUNNER_NAME} LABELS=${LABELS} bash -s" < ./scripts/setup-actions-runner.sh
+          exec 2> >(sed -E 's/\b([0-9]{1,3}\.){3}[0-9]{1,3}\b/***/g' >&2)
+          for i in {1..5}; do
+            # shellcheck disable=SC2086
+            ssh -i id_ssh $ssh_params "root@${IP}" "REPO=${GITHUB_REPOSITORY} TOKEN=${RUNNER_REGISTRATION_TOKEN} NAME=${ACTIONS_RUNNER_NAME} LABELS=${LABELS} bash -s" < ./scripts/setup-actions-runner.sh && break
+            [ "$i" = '5' ] && die 'SSH failed after 5 attempts.'
+            warn "SSH attempt $i failed. Retrying in 15 seconds…"
+            sleep 15
+          done
           success 'done'
 
   build:
@@ -189,8 +208,8 @@ jobs:
           info 'Installing and configuring bol-van/zapret…'
           sudo -- bash << 'EOSUDO'
             set -e
-            VER="$(curl -fsSL https://api.github.com/repos/bol-van/zapret/releases/latest | jq -er .tag_name)"
-            curl -fsSLo /tmp/zapret.tar.gz "https://github.com/bol-van/zapret/releases/download/${VER}/zapret-${VER}.tar.gz"
+            curl -fsSLo /tmp/zapret.tar.gz "https://github.com/bol-van/zapret/releases/download/${{ env.DEPENDENCIES_ZAPRET_VERSION }}/zapret-${{ env.DEPENDENCIES_ZAPRET_VERSION }}.tar.gz"
+            [ '${{ env.DEPENDENCIES_ZAPRET_SHA256 }}' = "$(sha256sum /tmp/zapret.tar.gz | awk '{print $1}')" ] || { echo 'Checksum verification failed!' >&2; exit 1; }
             mkdir -p /opt/zapret
             tar -xzf /tmp/zapret.tar.gz -C /opt/zapret --strip-components=1
             rm -f /tmp/zapret.tar.gz
@@ -367,7 +386,7 @@ jobs:
               exit 0
             fi
 
-            echo "Uploading ${#files[@]} asset(s)..."
+            echo "Uploading ${#files[@]} asset(s)…"
             # Fetch existing assets to handle duplicates
             http_code=$(curl_json GET "https://api.github.com/repos/${REPO}/releases/${release_id}/assets")
             if [[ "${http_code}" != "200" ]]; then
@@ -384,7 +403,7 @@ jobs:
               # If an asset with the same name exists, delete it to allow re-upload
               asset_id=$(jq -r --arg name "${name}" '.[] | select(.name==$name) | .id' <<< "${existing_assets}" | head -n1 || true)
               if [[ -n "${asset_id}" && "${asset_id}" != "null" ]]; then
-                echo "Deleting existing asset '${name}' (id=${asset_id})..."
+                echo "Deleting existing asset '${name}' (id=${asset_id})…"
                 http_code=$(curl_json DELETE "https://api.github.com/repos/${REPO}/releases/assets/${asset_id}")
                 if [[ "${http_code}" != "204" ]]; then
                   echo "Failed to delete existing asset ${name}. HTTP ${http_code}"
@@ -394,7 +413,7 @@ jobs:
               fi
 
               mime=$(file --mime-type -b "$f" || echo "application/octet-stream")
-              echo "Uploading '${name}' (${mime})..."
+              echo "Uploading '${name}' (${mime})…"
               # Note uploads use uploads.github.com
               http_code=$(curl -sS -X POST \
                 -H "Authorization: Bearer ${GITHUB_TOKEN}" -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" \
@@ -441,9 +460,9 @@ jobs:
     name: Cleanup server and runner
     needs: [runner, build]
     if: ${{ always() }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
     permissions:
-      contents: none
+      actions: write
     steps:
       - name: Uninstall runner
         if: ${{ ( needs.runner.outputs.server_ip != '' && needs.runner.outputs.server_sshkey != '' ) || needs.runner.outputs.runner_name != '' }}
@@ -465,20 +484,26 @@ jobs:
               -H "X-GitHub-Api-Version: 2022-11-28" \
               "/repos/${GITHUB_REPOSITORY}/actions/runners/remove-token" \
               | jq -er .token)"
+            exec 2> >(sed -E 's/\b([0-9]{1,3}\.){3}[0-9]{1,3}\b/***/g' >&2)
             touch id_ssh
             chmod 600 id_ssh
             printf %s "$SSHKEY" | openssl base64 -d -A | openssl enc -d -aes-256-cbc -pbkdf2 -k "$ROTATION_PASSPHRASE" -out id_ssh
             IP="$(printf %s "$IP" | openssl base64 -d -A | openssl enc -d -aes-256-cbc -pbkdf2 -k "$ROTATION_PASSPHRASE")"
             ssh_params="-o BatchMode=yes"
             if [ -z "$SSHHOSTS" ]; then
-              echo "No known hosts entry found. Will accept new fingerprints."
+              echo "No known hosts entry found. Will accept new fingerprints." >&2
               ssh_params+=" -o StrictHostKeyChecking=accept-new"
             else
               printf %s "$SSHHOSTS" | openssl base64 -d -A | openssl enc -d -aes-256-cbc -pbkdf2 -k "$ROTATION_PASSPHRASE" -out known_hosts
               ssh_params+=" -o StrictHostKeyChecking=yes -o UserKnownHostsFile=known_hosts"
             fi
-            # shellcheck disable=SC2086
-            ssh -i id_ssh $ssh_params "root@${IP}" "cd /opt/actions-runner/; ./svc.sh uninstall; sudo -u actions ./config.sh remove --token ${TOKEN}"
+            for i in {1..5}; do
+              # shellcheck disable=SC2086
+              ssh -i id_ssh $ssh_params "root@${IP}" "cd /opt/actions-runner/; ./svc.sh uninstall; sudo -u actions ./config.sh remove --token ${TOKEN}" && break
+              [ "$i" = '5' ] && echo '::error::SSH failed after 5 attempts.' >&2
+              echo "::warning::SSH attempt $i failed. Retrying in 15 seconds…" >&2
+              sleep 15
+            done
           elif [ -n "$NAME" ]; then
             runner_id="$(gh api --paginate \
               -H "Accept: application/vnd.github+json" \
@@ -486,19 +511,52 @@ jobs:
               "/repos/${GITHUB_REPOSITORY}/actions/runners?per_page=100" \
               --jq '.runners[] | select(.name=="'"$NAME"'") | .id' | head -n1)"
             if [ -n "$runner_id" ]; then
-              echo "Deleting runner $NAME…"
+              echo "Deleting runner $NAME…" >&2
               gh api -X DELETE \
                 -H "Accept: application/vnd.github+json" \
                 -H "X-GitHub-Api-Version: 2022-11-28" \
                 "/repos/${GITHUB_REPOSITORY}/actions/runners/${runner_id}"
             else
-              echo "Runner $NAME not found in $GITHUB_REPOSITORY."
+              echo "Runner $NAME not found in $GITHUB_REPOSITORY." >&2
               exit 1
             fi
           else
-            echo "Insufficient information to uninstall runner. Exiting."
+            echo "Insufficient information to uninstall runner. Exiting." >&2
             exit 1
           fi
+
+      - name: Collect server diagnostics
+        id: collect-diagnostics
+        if: ${{ ( needs.build.result == 'failure' || needs.runner.result == 'failure' ) && needs.runner.outputs.server_id != '' }}
+        continue-on-error: true
+        env:
+          RC_SECRETS: ${{ secrets.RC_SECRETS }}
+          ID: ${{ needs.runner.outputs.server_id }}
+        shell: bash
+        run: |
+          mkdir -p diagnostic
+          exec 2> >(sed -E 's/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/***/g; s@https?://[^\ ]+@***@g' >&2)
+          sudo apt-get update -qq
+          sudo apt-get install -qq python3 virtualenv python3-pip 1>/dev/null
+          virtualenv env 1>/dev/null
+          source env/bin/activate
+          pip3 install -qq python-openstackclient
+          echo "Installed: $(openstack --version)"
+          source /dev/stdin <<< "$RC_SECRETS"
+          if [ -z "$OS_PASSWORD" ]; then
+            echo '::error::OS_PASSWORD is empty, check RC_SECRETS'
+            exit 1
+          fi
+          openstack console log show "$ID" > diagnostic/console_log.txt || echo '::warning::Failed to get console log'
+
+      - name: Upload diagnostics
+        if: steps.collect-diagnostics.outcome == 'success'
+        continue-on-error: true
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4
+        with:
+          name: server-diagnostics
+          path: diagnostic
+          retention-days: 2
 
       - name: Delete server
         if: needs.runner.outputs.server_id != '' || needs.runner.outputs.server_ip_id != ''
@@ -511,20 +569,23 @@ jobs:
           error() {
             echo -e "\e[91m$1\e[0m" >&2
           }
-          sudo apt-get update -qq
-          sudo apt-get install -qq python3 virtualenv python3-pip 1>/dev/null
-          virtualenv env 1>/dev/null
-          source env/bin/activate
-          pip3 install -qq python-openstackclient
-          echo "Installed: $(openstack --version)"
+          exec 2> >(sed -E 's/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/***/g; s@https?://[^\ ]+@***@g' >&2)
+          if [ -d ./env ]; then
+            source ./env/bin/activate
+          else
+            sudo apt-get update -qq
+            sudo apt-get install -qq python3 virtualenv python3-pip 1>/dev/null
+            virtualenv env 1>/dev/null
+            source env/bin/activate
+            pip3 install -qq python-openstackclient
+            echo "Installed: $(openstack --version)"
+          fi
 
           source /dev/stdin <<< "$RC_SECRETS"
           if [ -z "$OS_PASSWORD" ]; then
             error 'OS_PASSWORD is empty, check RC_SECRETS'
             exit 1
           fi
-
-          exec 2> >(sed -E 's/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/***/g; s@https?://[^\ ]+@***@g' >&2)
 
           bad=0
           if [ -n "$ID" ]; then

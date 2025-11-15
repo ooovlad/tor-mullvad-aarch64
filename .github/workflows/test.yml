@@ -16,7 +16,7 @@ name: Continuous Tests
 jobs:
   test:
     name: Test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
     permissions:
       contents: read
     steps:
@@ -81,6 +81,7 @@ jobs:
           self-hosted-runner:
             labels:
               - tor-browser-build
+              - ubuntu-slim
           paths:
             .github/workflows/**/*.{yml,yaml}:
               ignore:
@@ -89,6 +90,10 @@ jobs:
           YAML
 
       - name: Validate GitHub Actions workflows with actionlint
-        uses: docker://rhysd/actionlint:latest
-        with:
-          args: -color
+        shell: bash
+        run: |
+          echo '::group::Install actionlint'
+          bash <(curl https://raw.githubusercontent.com/rhysd/actionlint/540883cefbfc9a4699a100553106d0039216f4f2/scripts/download-actionlint.bash)
+          echo '::endgroup::' && echo '::group::Run actionlint'
+          ./actionlint -color
+          echo '::endgroup::'
