@@ -1,8 +1,8 @@
 # Tor Browser & Mullvad Browser for ARM64/aarch64
 
-Stable builds of ![image](https://raw.githubusercontent.com/Botspot/pi-apps/refs/heads/master/apps/Tor/icon-24.png) **Tor Browser** and ![image](https://raw.githubusercontent.com/Botspot/pi-apps/refs/heads/master/apps/Mullvad/icon-24.png) **Mullvad Browser** for ARM64/aarch64 systems (e.g., Raspberry Pi, Apple Silicon, AWS Graviton). Available on [Pi-Apps](https://pi-apps.io).
+Stable builds of ![image](https://gitlab.torproject.org/tpo/applications/tor-browser/-/raw/4e338162754d71fc9db7fa1ecab2b37eba3a0d22/browser/branding/tb-release/default24.png) **Tor Browser** and ![image](https://gitlab.torproject.org/tpo/applications/mullvad-browser/-/raw/1685936d570e13d626a96eb841add02eb464cad0/browser/branding/mb-release/default24.png) **Mullvad Browser** for ARM64/aarch64 systems (e.g., Raspberry Pi, Apple Silicon, AWS Graviton).
 
-[![badge](https://github.com/Botspot/pi-apps/blob/master/icons/badge-light.png?raw=true)](https://github.com/Botspot/pi-apps)
+May be available on [Pi-Apps](https://pi-apps.io) in future. Reference: https://github.com/Botspot/pi-apps/pull/2859 . Currently we are waiting for upstream response on bringing official aarch64 stable builds.
 
 ###### 🤖 **Automated Builds**: New releases are built automatically via GitHub Actions whenever the Tor Project or Mullvad publish updates.
 
